@@ -23,7 +23,7 @@ A FastAPI application that analyzes a website URL using an LLM and returns struc
 | Validation | Pydantic v2 |
 | HTTP Client | HTTPX (async) |
 | HTML Parsing | BeautifulSoup4 + lxml |
-| LLM | Google Gemini 1.5 Flash |
+| LLM | Google Gemini 2.5 Flash |
 | Config | python-dotenv + pydantic-settings |
 | Testing | pytest |
 
@@ -273,10 +273,10 @@ pytest tests/ -v
 
 ### A. LLM Comparison Table
 
-| Criteria | Google Gemini 1.5 Flash | OpenAI GPT-4o Mini | Anthropic Claude 3 Haiku |
+| Criteria | Google Gemini 2.5 Flash | OpenAI GPT-4o Mini | Anthropic Claude 3 Haiku |
 |---|---|---|---|
 | **Provider** | Google DeepMind | OpenAI | Anthropic |
-| **Model** | gemini-1.5-flash | gpt-4o-mini | claude-3-haiku-20240307 |
+| **Model** | gemini-2.5-flash | gpt-4o-mini | claude-3-haiku-20240307 |
 | **Input Cost** | $0.075 / 1M tokens | $0.15 / 1M tokens | $0.25 / 1M tokens |
 | **Output Cost** | $0.30 / 1M tokens | $0.60 / 1M tokens | $1.25 / 1M tokens |
 | **Context Window** | 1,000,000 tokens | 128,000 tokens | 200,000 tokens |
@@ -292,14 +292,14 @@ pytest tests/ -v
 | Field | Details |
 |---|---|
 | **Recommended Provider** | Google (Gemini) |
-| **Recommended Model** | `gemini-1.5-flash` |
+| **Recommended Model** | `gemini-2.5-flash` |
 | **Estimated Input Tokens** | ~3,000–5,000 tokens per analysis |
 | **Estimated Output Tokens** | ~1,500–2,500 tokens per analysis |
 | **Estimated Cost per Analysis** | ~$0.001–$0.002 USD |
 | **Expected Response Time** | 3–6 seconds |
 | **Fallback Model** | OpenAI `gpt-4o-mini` |
 
-**Why Gemini 1.5 Flash:**
+**Why Gemini 2.5 Flash:**
 - **Lowest cost** among capable models (~2x cheaper than GPT-4o Mini for this use case)
 - **Largest context window** (1M tokens) handles full website content without truncation
 - **Native JSON output** via `response_mime_type="application/json"` eliminates parsing errors

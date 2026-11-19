@@ -1,7 +1,12 @@
 import json
 import re
-import google.generativeai as genai
+import httpx
 from app.config import get_settings
+
+GEMINI_REST_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "gemini-flash-lite-latest:generateContent"
+)
 
 ANALYSIS_PROMPT = """You are an expert business analyst and SEO specialist. Analyze the following website content and return a comprehensive JSON analysis.
 
@@ -83,15 +88,11 @@ Rules:
 
 
 def _extract_json(text: str) -> dict:
-    """Extract JSON from LLM response, handling markdown code blocks."""
     text = text.strip()
-
-    # Strip markdown code blocks
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\n?", "", text)
         text = re.sub(r"\n?```$", "", text)
         text = text.strip()
-
     return json.loads(text)
 
 
@@ -101,24 +102,28 @@ async def analyze_with_gemini(content_summary: str) -> dict:
     if not settings.gemini_api_key:
         raise ValueError("GEMINI_API_KEY is not configured")
 
-    genai.configure(api_key=settings.gemini_api_key)
-
-    model = genai.GenerativeModel(
-        model_name="gemini-1.5-flash",
-        generation_config=genai.types.GenerationConfig(
-            temperature=0.3,
-            response_mime_type="application/json",
-        ),
-    )
-
     prompt = ANALYSIS_PROMPT.format(content=content_summary)
 
-    response = model.generate_content(prompt)
-    raw_text = response.text
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.3,
+            "responseMimeType": "application/json",
+        },
+    }
 
+    async with httpx.AsyncClient(timeout=120) as client:
+        response = await client.post(
+            GEMINI_REST_URL,
+            params={"key": settings.gemini_api_key},
+            json=payload,
+        )
+        response.raise_for_status()
+
+    data = response.json()
+    raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
     return _extract_json(raw_text)
 
 
 async def run_llm_analysis(content_summary: str) -> dict:
-    """Run LLM analysis with Gemini as primary."""
     return await analyze_with_gemini(content_summary)
