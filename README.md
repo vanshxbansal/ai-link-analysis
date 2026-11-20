@@ -1,5 +1,7 @@
 # AI-Powered Website Link Analysis API
 
+**Live demo:** https://ai-link-analysis-k0gm.onrender.com/docs
+
 A FastAPI service that takes a website URL, extracts and cleans its content (homepage plus key About/Services/Products pages), and uses an LLM to produce a structured JSON analysis with five sections:
 
 1. **Competitor vs Your Brand**: brand overview, category, products/services, 3-5 competitors with strengths/weaknesses, competitive advantages, market gaps, positioning opportunities, and a Brand-vs-Competitor comparison table
@@ -546,9 +548,18 @@ docker run -p 4000:4000 -e GEMINI_API_KEY=your_key ai-link-analysis
 
 | Requirement | URL |
 |---|---|
-| Live Demo | `https://<your-deployment>` |
-| API Endpoint | `https://<your-deployment>/link-analysis` |
-| API Documentation | `https://<your-deployment>/docs` |
+| Live Demo | https://ai-link-analysis-k0gm.onrender.com |
+| API Endpoint | `POST https://ai-link-analysis-k0gm.onrender.com/link-analysis` |
+| API Documentation | https://ai-link-analysis-k0gm.onrender.com/docs |
+| Health Check | https://ai-link-analysis-k0gm.onrender.com/health |
+
+The service runs on Render's free tier, which sleeps after inactivity. The first request after idle can take about 30-50 s to wake up.
+
+```bash
+curl -X POST https://ai-link-analysis-k0gm.onrender.com/link-analysis \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://stripe.com"}'
+```
 
 ---
 
