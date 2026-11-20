@@ -1,10 +1,25 @@
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
-import httpx
+import asyncio
+import logging
+import time
 
+from fastapi import FastAPI, Query, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from app.config import get_settings
+from app.exceptions import AppError, InvalidURLError
 from app.schemas import AnalysisRequest, AnalysisResponse, ErrorResponse
 from app.services.analysis_service import run_full_analysis
-from app.utils.validators import validate_url, normalize_url
+from app.utils.validators import normalize_url, validate_url
+
+settings = get_settings()
+logging.basicConfig(
+    level=settings.log_level.upper(),
+    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+)
+logger = logging.getLogger("app")
 
 app = FastAPI(
     title="AI-Powered Website Link Analysis API",
@@ -12,8 +27,51 @@ app = FastAPI(
         "Analyzes a website URL and generates business, competitor, SEO, "
         "search query, and target audience insights using an LLM."
     ),
-    version="1.0.0",
+    version="1.1.0",
 )
+
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "POST"], allow_headers=["*"])
+
+
+def _error(status_code: int, error: str, detail: str = None) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content=ErrorResponse(error=error, detail=detail).model_dump(),
+    )
+
+
+@app.exception_handler(AppError)
+async def app_error_handler(request: Request, exc: AppError):
+    logger.warning("%s %s -> %d %s: %s", request.method, request.url.path, exc.status_code, exc.error, exc.detail)
+    return _error(exc.status_code, exc.error, exc.detail)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError):
+    messages = "; ".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors())
+    return _error(422, "Validation error", messages)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_error_handler(request: Request, exc: StarletteHTTPException):
+    return _error(exc.status_code, str(exc.detail))
+
+
+@app.exception_handler(Exception)
+async def unhandled_error_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled error on %s", request.url.path)
+    return _error(500, "Internal server error", "Analysis failed due to an unexpected error.")
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    started = time.perf_counter()
+    response = await call_next(request)
+    logger.info(
+        "%s %s %d %.0fms",
+        request.method, request.url.path, response.status_code, (time.perf_counter() - started) * 1000,
+    )
+    return response
 
 
 @app.get("/", include_in_schema=False)
@@ -23,60 +81,38 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "llm_configured": bool(settings.gemini_api_key or settings.openai_api_key),
+        "model": settings.gemini_model if settings.gemini_api_key else settings.openai_model,
+    }
 
 
 @app.post(
     "/link-analysis",
     response_model=AnalysisResponse,
     responses={
-        400: {"model": ErrorResponse, "description": "Invalid URL or inaccessible website"},
-        422: {"model": ErrorResponse, "description": "Validation error"},
-        500: {"model": ErrorResponse, "description": "Internal server error"},
+        400: {"model": ErrorResponse, "description": "Invalid URL or blocked (private/internal) address"},
+        422: {"model": ErrorResponse, "description": "Validation error or website has no readable content"},
+        502: {"model": ErrorResponse, "description": "Website inaccessible or LLM provider failure"},
+        503: {"model": ErrorResponse, "description": "LLM provider not configured"},
+        504: {"model": ErrorResponse, "description": "Website request timed out"},
     },
     summary="Analyze a website URL",
     description=(
-        "Accepts a website URL, extracts its content, and uses an LLM to generate "
-        "5 analysis sections: competitor analysis, search queries, SEO improvements, "
-        "top services, and target audience identification."
+        "Accepts a website URL, extracts its content (homepage plus key About/Services pages), "
+        "and uses an LLM to generate 5 analysis sections: competitor analysis, target search queries, "
+        "SEO improvements, top services, and target audience."
     ),
 )
-async def link_analysis(request: AnalysisRequest):
-    url = normalize_url(request.url.strip())
+async def link_analysis(
+    request: AnalysisRequest,
+    refresh: bool = Query(False, description="Bypass the cache and re-run the analysis"),
+):
+    url = normalize_url(request.url)
 
-    # Validate URL and check for SSRF
-    is_valid, error_msg = validate_url(url)
+    is_valid, error_msg = await asyncio.to_thread(validate_url, url)
     if not is_valid:
-        raise HTTPException(status_code=400, detail=error_msg)
+        raise InvalidURLError(error_msg)
 
-    try:
-        result = await run_full_analysis(url)
-        return result
-
-    except httpx.TimeoutException:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Request to {url} timed out. The website may be too slow or unreachable.",
-        )
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Website returned HTTP {e.response.status_code}. The page may not be accessible.",
-        )
-    except httpx.RequestError as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Could not reach the website: {str(e)}",
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
-
-
-@app.exception_handler(422)
-async def validation_exception_handler(request: Request, exc):
-    return JSONResponse(
-        status_code=422,
-        content={"success": False, "error": "Validation error", "detail": str(exc)},
-    )
+    return await run_full_analysis(url, use_cache=not refresh)

@@ -1,118 +1,140 @@
-from app.services.website_extractor import extract_website_content, build_content_summary
-from app.services.llm_service import run_llm_analysis
-from app.schemas import (
-    AnalysisResponse, BrandInfo, Analysis,
-    CompetitorAnalysis, Competitor, SearchQuery,
-    SEOImprovements, Service, TargetAudience,
-)
+"""Orchestrates extraction -> LLM analysis -> validation -> response."""
+
+import logging
+import time
+from collections import OrderedDict
+from typing import Optional, Tuple
+
 from app.config import get_settings
+from app.schemas import ALLOWED_PLATFORMS, AnalysisMeta, AnalysisResponse
+from app.services import llm_service, website_extractor
+from app.services.competitor_service import finalize_competitor_analysis
+
+logger = logging.getLogger(__name__)
 
 
-def _parse_competitor(c: dict) -> Competitor:
-    return Competitor(
-        name=c.get("name", "Unknown"),
-        overview=c.get("overview", ""),
-        strengths=c.get("strengths", []),
-        weaknesses=c.get("weaknesses", []),
+class TTLCache:
+    """Small in-memory LRU cache with expiry, to avoid paying twice for the same URL."""
+
+    def __init__(self, ttl_seconds: int, max_entries: int):
+        self.ttl = ttl_seconds
+        self.max_entries = max_entries
+        self._store: "OrderedDict[str, Tuple[float, AnalysisResponse]]" = OrderedDict()
+
+    def get(self, key: str) -> Optional[AnalysisResponse]:
+        item = self._store.get(key)
+        if not item:
+            return None
+        stored_at, value = item
+        if time.time() - stored_at > self.ttl:
+            self._store.pop(key, None)
+            return None
+        self._store.move_to_end(key)
+        return value
+
+    def set(self, key: str, value: AnalysisResponse) -> None:
+        self._store[key] = (time.time(), value)
+        self._store.move_to_end(key)
+        while len(self._store) > self.max_entries:
+            self._store.popitem(last=False)
+
+    def clear(self) -> None:
+        self._store.clear()
+
+
+_settings = get_settings()
+cache = TTLCache(_settings.cache_ttl_seconds, _settings.cache_max_entries)
+
+
+def _cache_key(url: str) -> str:
+    return url.strip().lower().rstrip("/")
+
+
+def _postprocess(result: llm_service.LLMResult):
+    """Apply business rules the LLM may not have followed exactly."""
+    output = result.data
+    analysis = output.analysis
+
+    competitor_analysis = finalize_competitor_analysis(
+        analysis.competitor_analysis, output.brand.name, output.brand.target_market
+    )
+    if not competitor_analysis.main_category:
+        competitor_analysis = competitor_analysis.model_copy(update={"main_category": output.brand.category})
+
+    # Keep 5 queries with at least one valid platform; make sure every platform is represented
+    queries = [q for q in analysis.target_search_queries if q.query and q.platforms][:5]
+    covered = {p for q in queries for p in q.platforms}
+    missing = [p for p in ALLOWED_PLATFORMS if p not in covered]
+    for q in queries:
+        if not missing:
+            break
+        if len(q.platforms) < 3:
+            q.platforms.append(missing.pop(0))
+
+    services = [s for s in analysis.top_services if s.service_name][:5]
+
+    return output.brand, analysis.model_copy(
+        update={
+            "competitor_analysis": competitor_analysis,
+            "target_search_queries": queries,
+            "top_services": services,
+        }
     )
 
 
-def _parse_response(url: str, raw: dict) -> AnalysisResponse:
-    brand_data = raw.get("brand", {})
-    brand = BrandInfo(
-        name=brand_data.get("name", "Unknown"),
-        category=brand_data.get("category", "Unknown"),
-        summary=brand_data.get("summary", ""),
-    )
-
-    analysis_data = raw.get("analysis", {})
-
-    # Competitor analysis
-    ca_data = analysis_data.get("competitor_analysis", {})
-    competitor_analysis = CompetitorAnalysis(
-        brand_overview=ca_data.get("brand_overview", ""),
-        main_products_services=ca_data.get("main_products_services", []),
-        competitive_advantages=ca_data.get("competitive_advantages", []),
-        competitors=[_parse_competitor(c) for c in ca_data.get("competitors", [])],
-        opportunities=ca_data.get("opportunities", []),
-    )
-
-    # Search queries
-    queries = []
-    for q in analysis_data.get("target_search_queries", []):
-        queries.append(SearchQuery(
-            query=q.get("query", ""),
-            platforms=q.get("platforms", []),
-            intent=q.get("intent", ""),
-            business_relevance=q.get("business_relevance", ""),
-            target_audience=q.get("target_audience", ""),
-        ))
-
-    # SEO
-    seo_data = analysis_data.get("seo_improvements", {})
-    seo = SEOImprovements(
-        primary_keyword=seo_data.get("primary_keyword", ""),
-        secondary_keywords=seo_data.get("secondary_keywords", []),
-        long_tail_keywords=seo_data.get("long_tail_keywords", []),
-        recommended_title=seo_data.get("recommended_title", ""),
-        meta_description=seo_data.get("meta_description", ""),
-        supporting_content=seo_data.get("supporting_content", []),
-    )
-
-    # Services
-    services = []
-    for s in analysis_data.get("top_services", []):
-        services.append(Service(
-            service_name=s.get("service_name", ""),
-            description=s.get("description", ""),
-            target_industry=s.get("target_industry", ""),
-            target_customer=s.get("target_customer", ""),
-            main_benefit=s.get("main_benefit", ""),
-        ))
-
-    # Audience
-    aud_data = analysis_data.get("target_audience", {})
-    audience = TargetAudience(
-        primary_audience=aud_data.get("primary_audience", []),
-        secondary_audience=aud_data.get("secondary_audience", []),
-        industries=aud_data.get("industries", []),
-        business_types=aud_data.get("business_types", []),
-        customer_profiles=aud_data.get("customer_profiles", []),
-        geographical_focus=aud_data.get("geographical_focus"),
-        customer_needs=aud_data.get("customer_needs", []),
-        potential_interests=aud_data.get("potential_interests", []),
-        recommended_segments=aud_data.get("recommended_segments", []),
-    )
-
-    return AnalysisResponse(
-        success=True,
-        website=url,
-        brand=brand,
-        analysis=Analysis(
-            competitor_analysis=competitor_analysis,
-            target_search_queries=queries,
-            seo_improvements=seo,
-            top_services=services,
-            target_audience=audience,
-        ),
-    )
-
-
-async def run_full_analysis(url: str) -> AnalysisResponse:
+async def run_full_analysis(url: str, use_cache: bool = True) -> AnalysisResponse:
     settings = get_settings()
+    started = time.perf_counter()
+    key = _cache_key(url)
 
-    # 1. Extract website content
-    content = await extract_website_content(
+    if use_cache:
+        cached = cache.get(key)
+        if cached:
+            logger.info("Cache hit for %s", url)
+            meta = cached.meta.model_copy(update={"cached": True}) if cached.meta else None
+            return cached.model_copy(update={"meta": meta})
+
+    # 1-5. Fetch, extract, clean
+    content = await website_extractor.extract_website_content(
         url,
         timeout=settings.request_timeout,
         max_length=settings.max_content_length,
+        max_bytes=settings.max_html_bytes,
+        max_extra_pages=settings.max_extra_pages,
+    )
+    summary = website_extractor.build_content_summary(content, settings.max_llm_content_chars)
+    logger.info(
+        "Extracted %s: pages=%d chars_sent=%d (homepage text=%d chars)",
+        content.url, content.pages_analyzed, len(summary), len(content.main_text),
     )
 
-    # 2. Build a compact summary for the LLM
-    summary = build_content_summary(content)
+    # 6-8. LLM analysis + validation
+    result = await llm_service.run_llm_analysis(summary)
+    brand, analysis = _postprocess(result)
 
-    # 3. Run LLM analysis
-    raw_result = await run_llm_analysis(summary)
+    # Feed the real on-page title/meta into the SEO section for comparison
+    seo = analysis.seo_improvements.model_copy(
+        update={"current_title": content.title, "current_meta_description": content.meta_description}
+    )
+    analysis = analysis.model_copy(update={"seo_improvements": seo})
 
-    # 4. Parse and validate
-    return _parse_response(url, raw_result)
+    response = AnalysisResponse(
+        success=True,
+        website=url,
+        brand=brand,
+        analysis=analysis,
+        meta=AnalysisMeta(
+            provider=result.provider,
+            model=result.model,
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            estimated_cost_usd=result.estimated_cost_usd,
+            llm_latency_ms=result.latency_ms,
+            total_latency_ms=int((time.perf_counter() - started) * 1000),
+            pages_analyzed=content.pages_analyzed,
+            content_chars_sent=len(summary),
+            cached=False,
+        ),
+    )
+    cache.set(key, response)
+    return response
